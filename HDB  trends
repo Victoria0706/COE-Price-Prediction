@@ -1,0 +1,749 @@
+from google.colab import files
+
+uploaded = files.upload()
+
+#Initialization 
+import pandas as pd
+
+filename = "Resale flat prices based on registration date from Jan-2017 onwards.xlsx"
+
+df = pd.read_excel(filename, engine="openpyxl")
+print(df.head())
+ 
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+sns.set_theme(style="whitegrid")
+
+# Load the data if needed
+# df = pd.read_csv("hdb_resale.csv")
+
+# Check that important columns exist
+required_columns = [
+    "month",
+    "town",
+    "flat_type",
+    "storey_range",
+    "floor_area_sqm",
+    "lease_commence_date",
+    "resale_price",
+]
+
+missing_columns = [col for col in required_columns if col not in df.columns]
+
+if missing_columns:
+    raise ValueError(f"Missing columns: {missing_columns}")
+
+# Convert data types
+df["month"] = pd.to_datetime(
+    df["month"],
+    format="%Y-%m",
+    errors="coerce"
+)
+
+numeric_columns = [
+    "resale_price",
+    "floor_area_sqm",
+    "lease_commence_date",
+]
+
+for col in numeric_columns:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# Remove invalid observations
+df = df.dropna(
+    subset=[
+        "month",
+        "resale_price",
+        "floor_area_sqm",
+        "town",
+        "flat_type",
+    ]
+).copy()
+
+df = df[
+    (df["resale_price"] > 0) &
+    (df["floor_area_sqm"] > 0)
+].copy()
+
+# Standardise text columns
+text_columns = [
+    "town",
+    "flat_type",
+    "storey_range",
+    "flat_model",
+]
+
+for col in text_columns:
+    if col in df.columns:
+        df[col] = df[col].astype("string").str.strip().str.upper()
+
+print(df.info())
+print(df.head())
+
+# Price per square metre
+df["price_psm"] = (
+    df["resale_price"] / df["floor_area_sqm"]
+)
+
+# Calendar variables
+df["year"] = df["month"].dt.year
+df["month_number"] = df["month"].dt.month
+df["month_name"] = df["month"].dt.strftime("%b")
+df["quarter"] = df["month"].dt.to_period("Q").astype(str)
+
+# Approximate lease age at transaction
+df["lease_age"] = (
+    df["year"] - df["lease_commence_date"]
+)
+
+# Approximate remaining lease based on a 99-year lease
+df["estimated_remaining_lease"] = (
+    99 - df["lease_age"]
+)
+
+# Million-dollar transaction indicator
+df["million_dollar"] = (
+    df["resale_price"] >= 1_000_000
+)
+
+# Extract the lower floor from storey-range values such as "10 TO 12"
+df["storey_lower"] = pd.to_numeric(
+    df["storey_range"].str.extract(r"(\d+)")[0],
+    errors="coerce"
+)
+
+# Group flats into broad age categories
+df["lease_age_group"] = pd.cut(
+    df["lease_age"],
+    bins=[-np.inf, 10, 20, 30, 40, 50, np.inf],
+    labels=[
+        "0–10 years",
+        "11–20 years",
+        "21–30 years",
+        "31–40 years",
+        "41–50 years",
+        "Over 50 years",
+    ],
+)
+
+monthly = (
+    df.groupby("month")
+      .agg(
+          transaction_count=("resale_price", "size"),
+          median_price=("resale_price", "median"),
+          mean_price=("resale_price", "mean"),
+          median_price_psm=("price_psm", "median"),
+          median_floor_area=("floor_area_sqm", "median"),
+          million_dollar_transactions=("million_dollar", "sum"),
+      )
+      .sort_index()
+)
+
+# Add any missing calendar months
+complete_months = pd.date_range(
+    start=monthly.index.min(),
+    end=monthly.index.max(),
+    freq="MS",
+)
+
+monthly = monthly.reindex(complete_months)
+monthly.index.name = "month"
+
+# Transaction counts are zero for missing months
+monthly["transaction_count"] = (
+    monthly["transaction_count"].fillna(0)
+)
+
+monthly["million_dollar_transactions"] = (
+    monthly["million_dollar_transactions"].fillna(0)
+)
+
+# Million-dollar transaction share
+monthly["million_dollar_share"] = (
+    monthly["million_dollar_transactions"]
+    .div(monthly["transaction_count"].replace(0, np.nan))
+    .mul(100)
+)
+
+# Year-over-year price change
+monthly["price_yoy_pct"] = (
+    monthly["median_price"]
+    .pct_change(periods=12, fill_method=None)
+    .mul(100)
+)
+
+# Rolling indicators
+monthly["volume_3m_avg"] = (
+    monthly["transaction_count"]
+    .rolling(window=3, min_periods=1)
+    .mean()
+)
+
+monthly["price_12m_median"] = (
+    monthly["median_price"]
+    .rolling(window=12, min_periods=6)
+    .median()
+)
+
+monthly["price_psm_12m_median"] = (
+    monthly["median_price_psm"]
+    .rolling(window=12, min_periods=6)
+    .median()
+)
+
+monthly = monthly.reset_index()
+
+print(monthly.tail(12).round(2))
+
+#Monthly HDB Resale Transaction Volume 
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Ensure the columns are valid and sorted chronologically
+monthly["month"] = pd.to_datetime(monthly["month"])
+
+plot_data = (
+    monthly[["month", "transaction_count"]]
+    .dropna()
+    .sort_values("month")
+)
+
+# Find the highest and lowest monthly transaction volumes
+highest = plot_data.loc[plot_data["transaction_count"].idxmax()]
+lowest = plot_data.loc[plot_data["transaction_count"].idxmin()]
+
+plt.figure(figsize=(14, 6))
+
+sns.lineplot(
+    data=plot_data,
+    x="month",
+    y="transaction_count",
+    label="Monthly transactions",
+    color="navy",
+    alpha=0.7,
+)
+
+# Highlight the highest point
+plt.scatter(
+    highest["month"],
+    highest["transaction_count"],
+    color="red",
+    label="Highest",
+)
+
+plt.annotate(
+    text=(
+        f'Highest: {highest["transaction_count"]:,.0f}\n'
+        f'{highest["month"]:%b %Y}'
+    ),
+    xy=(highest["month"], highest["transaction_count"]),
+    xytext=(0, 30),
+    textcoords="offset points",
+    ha="center",
+    color="red",
+    fontweight="bold",
+    arrowprops={
+        "arrowstyle": "->",
+        "color": "red",
+    },
+)
+
+# Highlight the lowest point
+plt.scatter(
+    lowest["month"],
+    lowest["transaction_count"],
+    color="green",
+    label="Lowest",
+)
+
+plt.annotate(
+    text=(
+        f'Lowest: {lowest["transaction_count"]:,.0f}\n'
+        f'{lowest["month"]:%b %Y}'
+    ),
+    xy=(lowest["month"], lowest["transaction_count"]),
+    xytext=(0, -45),
+    textcoords="offset points",
+    ha="center",
+    color="green",
+    fontweight="bold",
+    arrowprops={
+        "arrowstyle": "->",
+        "color": "green",
+    },
+)
+
+plt.title("Monthly HDB Resale Transaction Volume")
+plt.xlabel("Year")
+plt.ylabel("Number of transactions")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+town_summary = (
+    df.groupby("town")
+      .agg(
+          transactions=("resale_price", "size"),
+          median_price=("resale_price", "median"),
+          median_price_psm=("price_psm", "median"),
+          median_floor_area=("floor_area_sqm", "median"),
+          million_dollar_sales=("million_dollar", "sum"),
+      )
+      .reset_index()
+)
+
+town_summary["million_dollar_share"] = (
+    town_summary["million_dollar_sales"]
+    .div(town_summary["transactions"])
+    .mul(100)
+)
+
+#Town Summary
+town_summary = (
+    town_summary[
+        town_summary["transactions"] >= 100
+    ]
+    .sort_values("median_price_psm", ascending=False)
+)
+
+print(town_summary.head(10).round(2))
+
+
+
+
+import pandas as pd
+
+town_summary = (
+    df.groupby("town", as_index=False)
+      .agg(
+          transactions=("resale_price", "size"),
+          median_price=("resale_price", "median"),
+          median_price_psm=("price_psm", "median"),
+          median_floor_area=("floor_area_sqm", "median"),
+          million_dollar_sales=("million_dollar", "sum"),
+      )
+
+)
+
+
+# Calculate the percentage of million-dollar sales
+town_summary["million_dollar_share"] = (
+    town_summary["million_dollar_sales"]
+    .div(town_summary["transactions"])
+    .mul(100)
+)
+
+# Sort towns by median price per square metre
+town_summary = (
+    town_summary
+    .sort_values(
+        by="town",
+        ascending=True,
+    )
+)
+
+# Start the displayed ranking at 1
+town_summary.index = town_summary.index + 1
+town_summary.index.name = "rank"
+
+# Confirm the number of towns
+print(f"Number of towns: {town_summary['town'].nunique()}")
+
+# Display all towns and columns as a table
+with pd.option_context(
+    "display.max_rows", 26,
+    "display.max_columns", None,
+    "display.width", None,
+):
+    display(town_summary)
+
+#Room trends 
+import pandas as pd
+
+flat_type_summary = (
+    df.groupby("flat_type", as_index=False)
+      .agg(
+          transactions=("resale_price", "size"),
+          median_price=("resale_price", "median"),
+          median_price_psm=("price_psm", "median"),
+          median_area=("floor_area_sqm", "median"),
+      )
+      .sort_values("median_price")
+      .reset_index(drop=True)
+)
+
+
+
+display(flat_type_summary.round(2))
+
+
+# Median Resale Price by Flat Type and Median Price per Square Metre by Flat Type 
+fig, axes = plt.subplots(
+    nrows=1,
+    ncols=2,
+    figsize=(15, 6),
+)
+
+sns.barplot(
+    data=flat_type_summary,
+    x="median_price",
+    y="flat_type",
+    hue="flat_type",
+    legend=False,
+    ax=axes[0],
+    palette="Blues_d",
+)
+
+axes[0].set_title("Median Resale Price by Flat Type")
+axes[0].set_xlabel("Median price")
+axes[0].set_ylabel("Flat type")
+
+sns.barplot(
+    data=flat_type_summary,
+    x="median_price_psm",
+    y="flat_type",
+    hue="flat_type",
+    legend=False,
+    ax=axes[1],
+    palette="Oranges_d",
+)
+
+axes[1].set_title("Median Price per Square Metre by Flat Type")
+axes[1].set_xlabel("Median price per sqm")
+axes[1].set_ylabel("")
+
+plt.tight_layout()
+plt.show()
+
+# Remaining Lease
+import pandas as pd
+import numpy as np
+
+df["remaining_lease_age_group"] = pd.cut(
+    df["estimated_remaining_lease"],
+    bins=[-np.inf, 10, 20, 30, 40, 50, 60, 70, 80, 90, np.inf],
+    labels=[
+        "0–10 years",
+        "11–20 years",
+        "21–30 years",
+        "31–40 years",
+        "41–50 years",
+        "51–60 years",
+        "61–70 years",
+        "71–80 years",
+        "81–90 years",
+        "Over 90 years",
+    ],
+)
+
+remaining_lease_summary = (
+    df.dropna(subset=["remaining_lease_age_group"])
+      .groupby("remaining_lease_age_group", observed=True)
+      .agg(
+          transactions=("resale_price", "size"),
+          median_price=("resale_price", "median"),
+          median_price_psm=("price_psm", "median"),
+      )
+      .reset_index()
+)
+
+# Add a total row
+total_row = pd.DataFrame({
+    "remaining_lease_age_group": ["TOTAL"],
+    "transactions": [remaining_lease_summary["transactions"].sum()],
+})
+
+remaining_lease_summary = pd.concat(
+    [remaining_lease_summary, total_row],
+    ignore_index=True,
+)
+
+display(remaining_lease_summary.round(2))
+
+print(remaining_lease_summary.round(2))
+
+# Town with Transaction with Minimum Remaining Lease, Median Remaining Lease, Average Remaining Lease and Maximum Remaining Lease 
+
+# Normalize column names, for example:
+# "Remaining Lease" -> "remaining_lease"
+df.columns = (
+    df.columns
+      .str.strip()
+      .str.lower()
+      .str.replace(r"\s+", "_", regex=True)
+)
+
+
+town_remaining_lease = (
+    df.groupby("town", as_index=False)
+      .agg(
+          transactions=("remaining_lease_years", "size"),
+          minimum_remaining_lease_years=(
+              "remaining_lease_years",
+              "min",
+          ),
+          median_remaining_lease_years=(
+              "remaining_lease_years",
+              "median",
+          ),
+          average_remaining_lease_years=(
+              "remaining_lease_years",
+              "mean",
+          ),
+          maximum_remaining_lease_years=(
+              "remaining_lease_years",
+              "max",
+          ),
+      )
+      .sort_values(
+          "town",
+          ascending=True,
+      )
+      .reset_index(drop=True)
+)  # Closes town_remaining_lease = (
+
+# Round remaining-lease values
+lease_columns = [
+    "minimum_remaining_lease_years",
+    "median_remaining_lease_years",
+    "average_remaining_lease_years",
+    "maximum_remaining_lease_years",
+]
+
+town_remaining_lease[lease_columns] = (
+    town_remaining_lease[lease_columns].round(1)
+)
+
+# Display every town
+with pd.option_context(
+    "display.max_rows", None,
+    "display.max_columns", None,
+    "display.width", None,
+):
+    display(town_remaining_lease)
+
+#Storey Trends
+storey_summary = (
+    df.dropna(subset=["storey_lower"])
+      .groupby("storey_range")
+      .agg(
+          lower_storey=("storey_lower", "first"),
+          transactions=("resale_price", "size"),
+          median_price=("resale_price", "median"),
+          median_price_psm=("price_psm", "median"),
+      )
+      .reset_index()
+      .sort_values("lower_storey")
+)
+
+print(storey_summary.round(2))
+
+# Monthly Median HDB Resale Price per Square Metre by Year 
+plt.figure(figsize=(14, 7))
+
+sns.lineplot(
+    data=seasonality,
+    x="month_number",
+    y="median_price_psm",
+    hue="year",
+    marker="o",
+    palette="tab10"
+)
+
+plt.xticks(
+    range(1, 13),
+    [calendar.month_abbr[i] for i in range(1, 13)]
+)
+
+plt.title("Monthly Median HDB Resale Price per Square Metre by Year")
+plt.xlabel("Month")
+plt.ylabel("Median Price per Square Metre")
+plt.grid(alpha=0.3)
+plt.legend(
+    title="Year",
+    bbox_to_anchor=(1.02, 1),
+    loc="upper left"
+)
+plt.tight_layout()
+plt.show()
+
+# Average HDB Resale Transaction Volume by Calendar Month 
+import calendar
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Calculate overall monthly seasonality
+overall_seasonality = (
+    seasonality
+    .groupby("month_number", as_index=False)
+    .agg(
+        average_transaction_count=(
+            "transaction_count",
+            "mean"
+        )
+    )
+    .sort_values("month_number")
+)
+
+# Add abbreviated month names
+overall_seasonality["month_name"] = (
+    overall_seasonality["month_number"]
+    .map(lambda month: calendar.month_abbr[int(month)])
+)
+
+# Find the highest and lowest values
+highest = overall_seasonality.loc[
+    overall_seasonality[
+        "average_transaction_count"
+    ].idxmax()
+]
+
+lowest = overall_seasonality.loc[
+    overall_seasonality[
+        "average_transaction_count"
+    ].idxmin()
+]
+
+# Plot
+plt.figure(figsize=(13, 6))
+
+sns.lineplot(
+    data=overall_seasonality,
+    x="month_number",
+    y="average_transaction_count",
+    marker="o",
+    color="steelblue"
+)
+
+# Highlight the highest point
+plt.scatter(
+    highest["month_number"],
+    highest["average_transaction_count"],
+    color="red",
+    s=110,
+    zorder=5,
+    label="Highest"
+)
+
+# Highlight the lowest point
+plt.scatter(
+    lowest["month_number"],
+    lowest["average_transaction_count"],
+    color="green",
+    s=110,
+    zorder=5,
+    label="Lowest"
+)
+
+# Annotate the highest point
+plt.annotate(
+    text=(
+        f'Highest: '
+        f'{highest["average_transaction_count"]:,.0f}\n'
+        f'{highest["month_name"]}'
+    ),
+    xy=(
+        highest["month_number"],
+        highest["average_transaction_count"]
+    ),
+    xytext=(0, 45),
+    textcoords="offset points",
+    ha="center",
+    color="red",
+    fontweight="bold",
+    arrowprops={
+        "arrowstyle": "->",
+        "color": "red"
+    }
+)
+
+# Annotate the lowest point
+plt.annotate(
+    text=(
+        f'Lowest: '
+        f'{lowest["average_transaction_count"]:,.0f}\n'
+        f'{lowest["month_name"]}'
+    ),
+    xy=(
+        lowest["month_number"],
+        lowest["average_transaction_count"]
+    ),
+    xytext=(0, -55),
+    textcoords="offset points",
+    ha="center",
+    color="green",
+    fontweight="bold",
+    arrowprops={
+        "arrowstyle": "->",
+        "color": "green"
+    }
+)
+
+# Formatting
+plt.title(
+    "Average HDB Resale Transaction Volume by Calendar Month"
+)
+plt.xlabel("Month")
+plt.ylabel("Average Number of Transactions")
+
+plt.xticks(
+    ticks=range(1, 13),
+    labels=[
+        calendar.month_abbr[i]
+        for i in range(1, 13)
+    ]
+)
+
+plt.grid(alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# Display values
+display(overall_seasonality.round(2))
+
+# Price PSM Year Over Year Percent 
+
+town_year = (
+    df.groupby(["town", "year"])
+      .agg(
+          transactions=("resale_price", "size"),
+          median_price_psm=("price_psm", "median"),
+      )
+      .reset_index()
+      .sort_values(["town", "year"])
+)
+
+town_year["price_psm_yoy_pct"] = (
+    town_year.groupby("town")["median_price_psm"]
+    .pct_change(fill_method=None)
+    .mul(100)
+)
+
+latest_year = town_year["year"].max()
+
+fastest_growing_towns = (
+    town_year[
+        (town_year["year"] == latest_year) &
+        (town_year["transactions"] >= 50)
+    ]
+    .sort_values("price_psm_yoy_pct", ascending=False)
+)
+
+print(
+    fastest_growing_towns[
+        [
+            "town",
+            "transactions",
+            "median_price_psm",
+            "price_psm_yoy_pct",
+        ]
+    ].head(27).round(2)
+)
+
+
+
