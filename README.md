@@ -1,320 +1,748 @@
-# coe_model_simplified_fixed.py
-import re
-from pathlib import Path
+from google.colab import files
 
+uploaded = files.upload()
+
+#Initialization 
+import pandas as pd
+
+filename = "Resale flat prices based on registration date from Jan-2017 onwards.xlsx"
+
+df = pd.read_excel(filename, engine="openpyxl")
+print(df.head())
+ 
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
+import seaborn as sns
+import matplotlib.pyplot as plt
 
+sns.set_theme(style="whitegrid")
 
-# Parsing utilities
+# Load the data if needed
+# df = pd.read_csv("hdb_resale.csv")
 
-MONTH_ABBR = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4,
-              'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8,
-              'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+# Check that important columns exist
+required_columns = [
+    "month",
+    "town",
+    "flat_type",
+    "storey_range",
+    "floor_area_sqm",
+    "lease_commence_date",
+    "resale_price",
+]
 
-def parse_period(label: str) -> pd.Timestamp:
-    m = re.match(r'^(\d{4})([A-Za-z]{3})$', str(label))
-    if not m:
-        raise ValueError(f"Unexpected period label: {label}")
-    year = int(m.group(1))
-    mon = MONTH_ABBR[m.group(2).title()]
-    return pd.Timestamp(year=year, month=mon, day=1)
+missing_columns = [col for col in required_columns if col not in df.columns]
 
-def load_long(xlsx_path: str | Path) -> pd.DataFrame:
-    dfw = pd.read_excel(xlsx_path, header=0)
-    period_cols = [c for c in dfw.columns if re.match(r'^\d{4}[A-Za-z]{3}$', str(c))]
-    if not period_cols:
-        raise ValueError("No 'YYYYMon' columns found in the sheet.")
-    series_col = dfw.columns[0]
-    dfw = dfw[[series_col] + period_cols].copy()
-    dfl = dfw.melt(id_vars=series_col, var_name='period', value_name='value')
-    dfl['date'] = dfl['period'].apply(parse_period)
-    dfl = dfl.rename(columns={series_col: 'series'}).drop(columns=['period'])
-    dfl['value'] = pd.to_numeric(dfl['value'], errors='coerce')
-    return dfl
+if missing_columns:
+    raise ValueError(f"Missing columns: {missing_columns}")
 
-def find_series(dfl: pd.DataFrame, tokens: list[str]) -> pd.Series:
-    s = dfl['series'].str.lower().fillna('')
-    mask = np.ones(len(s), dtype=bool)
-    for t in tokens:
-        mask &= s.str.contains(t.lower(), regex=False)
-    candidates = dfl.loc[mask, 'series'].unique()
-    if len(candidates) == 0:
-        raise KeyError(f"No series matched tokens: {tokens}")
-    name = sorted(candidates, key=len, reverse=True)[0]
-    ts = (dfl[dfl['series'] == name]
-          .set_index('date')['value']
-          .sort_index()
-          .asfreq('MS'))
-    return ts.rename(name)
+# Convert data types
+df["month"] = pd.to_datetime(
+    df["month"],
+    format="%Y-%m",
+    errors="coerce"
+)
 
+numeric_columns = [
+    "resale_price",
+    "floor_area_sqm",
+    "lease_commence_date",
+]
 
-# Model builder (log-OLS)
-def build_design(price: pd.Series, quota: pd.Series, add_month_fe=True, lag1=True) -> pd.DataFrame:
-    df = pd.concat({'price': price, 'quota': quota}, axis=1)
-    df = df.replace([np.inf, -np.inf], np.nan).dropna()
-    df = df[(df['price'] > 0) & (df['quota'] > 0)]
-    df['ln_price'] = np.log(df['price'])
-    df['ln_quota'] = np.log(df['quota'])
-    if lag1:
-        df['ln_price_lag1'] = df['ln_price'].shift(1)
-    if add_month_fe:
-        df['month'] = df.index.month.astype(int)
-        month_fe = pd.get_dummies(df['month'], prefix='m', drop_first=True)
-        df = pd.concat([df, month_fe], axis=1)
-    df = df.dropna()
-    return df
+for col in numeric_columns:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
 
-def fit_log_ols(df: pd.DataFrame, include_month_fe=True):
-    X_cols = ['ln_quota', 'ln_price_lag1']
-    if include_month_fe:
-        X_cols += [c for c in df.columns if c.startswith('m_')]
-    # Ensure numeric float dtypes
-    X = df[X_cols].apply(pd.to_numeric, errors='coerce').astype(float)
-    y = pd.to_numeric(df['ln_price'], errors='coerce').astype(float)
-    X = sm.add_constant(X, has_constant='add')
-    # Pass DataFrames/Series (not numpy arrays) so statsmodels retains column names
-    model = sm.OLS(y, X, missing='drop')
-    res = model.fit(cov_type='HC1')
-    return res
-
-
-# End-to-end runner
-
-def main(xlsx_path: str | Path):
-    dfl = load_long(xlsx_path)
-
-    # Tokens (adjust if labels differ slightly in your file)
-    # Category A: price (1st bidding) and quota (fallback: 2nd bidding)
-    catA_price_tokens = ["Cars Up To 1600cc And 97kW", "Quota Premium", "1st Bidding"]
-    catA_quota_options = [
-        ["Cars Up To 1600cc And 97kW", "Quota", "1st Bidding"],
-        ["Cars Up To 1600cc And 97kW", "Quota", "2nd Bidding"],
+# Remove invalid observations
+df = df.dropna(
+    subset=[
+        "month",
+        "resale_price",
+        "floor_area_sqm",
+        "town",
+        "flat_type",
     ]
-    # Category B: price (1st bidding) and quota (try 1st, fallback 2nd)
-    catB_price_tokens = ["Cars Above 1600cc Or 97kW", "Quota Premium", "1st Bidding"]
-    catB_quota_options = [
-        ["Cars Above 1600cc Or 97kW", "Quota", "1st Bidding"],
-        ["Cars Above 1600cc Or 97kW", "Quota", "2nd Bidding"],
-    ]
+).copy()
 
-    # Resolve series
-    catA_price = find_series(dfl, catA_price_tokens)
-    catA_quota = None
-    for tok in catA_quota_options:
-        try:
-            catA_quota = find_series(dfl, tok)
-            break
-        except KeyError:
-            continue
-    if catA_quota is None:
-        raise KeyError("Category A quota series not found. Adjust tokens.")
+df = df[
+    (df["resale_price"] > 0) &
+    (df["floor_area_sqm"] > 0)
+].copy()
 
-    catB_price = find_series(dfl, catB_price_tokens)
-    catB_quota = None
-    for tok in catB_quota_options:
-        try:
-            catB_quota = find_series(dfl, tok)
-            break
-        except KeyError:
-            continue
-    if catB_quota is None:
-        raise KeyError("Category B quota series not found. Adjust tokens.")
+# Standardise text columns
+text_columns = [
+    "town",
+    "flat_type",
+    "storey_range",
+    "flat_model",
+]
 
-    # Build designs
-    A_df = build_design(catA_price, catA_quota, add_month_fe=True, lag1=True)
-    B_df = build_design(catB_price, catB_quota, add_month_fe=True, lag1=True)
+for col in text_columns:
+    if col in df.columns:
+        df[col] = df[col].astype("string").str.strip().str.upper()
 
-    # Fit and report
-    print("=== Category A (log-OLS) ===")
-    A_res = fit_log_ols(A_df, include_month_fe=True)
-    print(A_res.summary())
-    print(f"\nEstimated quota price elasticity (beta_A on ln_quota): {A_res.params['ln_quota']:.3f}")
+print(df.info())
+print(df.head())
 
-    print("\n=== Category B (log-OLS) ===")
-    B_res = fit_log_ols(B_df, include_month_fe=True)
-    print(B_res.summary())
-    print(f"\nEstimated quota price elasticity (beta_B on ln_quota): {B_res.params['ln_quota']:.3f}")
+# Price per square metre
+df["price_psm"] = (
+    df["resale_price"] / df["floor_area_sqm"]
+)
 
-if __name__ == "__main__":
-    xlsx_path = "MotorVehicleQuotaQuotaPremiumAndPrevailingQuotaPremiumMonthly.xlsx"
-    main(xlsx_path)
+# Calendar variables
+df["year"] = df["month"].dt.year
+df["month_number"] = df["month"].dt.month
+df["month_name"] = df["month"].dt.strftime("%b")
+df["quarter"] = df["month"].dt.to_period("Q").astype(str)
 
-    # coe_predictability_plots.py
-import re
-from pathlib import Path
+# Approximate lease age at transaction
+df["lease_age"] = (
+    df["year"] - df["lease_commence_date"]
+)
 
-import numpy as np
+# Approximate remaining lease based on a 99-year lease
+df["estimated_remaining_lease"] = (
+    99 - df["lease_age"]
+)
+
+# Million-dollar transaction indicator
+df["million_dollar"] = (
+    df["resale_price"] >= 1_000_000
+)
+
+# Extract the lower floor from storey-range values such as "10 TO 12"
+df["storey_lower"] = pd.to_numeric(
+    df["storey_range"].str.extract(r"(\d+)")[0],
+    errors="coerce"
+)
+
+# Group flats into broad age categories
+df["lease_age_group"] = pd.cut(
+    df["lease_age"],
+    bins=[-np.inf, 10, 20, 30, 40, 50, np.inf],
+    labels=[
+        "0–10 years",
+        "11–20 years",
+        "21–30 years",
+        "31–40 years",
+        "41–50 years",
+        "Over 50 years",
+    ],
+)
+
+monthly = (
+    df.groupby("month")
+      .agg(
+          transaction_count=("resale_price", "size"),
+          median_price=("resale_price", "median"),
+          mean_price=("resale_price", "mean"),
+          median_price_psm=("price_psm", "median"),
+          median_floor_area=("floor_area_sqm", "median"),
+          million_dollar_transactions=("million_dollar", "sum"),
+      )
+      .sort_index()
+)
+
+# Add any missing calendar months
+complete_months = pd.date_range(
+    start=monthly.index.min(),
+    end=monthly.index.max(),
+    freq="MS",
+)
+
+monthly = monthly.reindex(complete_months)
+monthly.index.name = "month"
+
+# Transaction counts are zero for missing months
+monthly["transaction_count"] = (
+    monthly["transaction_count"].fillna(0)
+)
+
+monthly["million_dollar_transactions"] = (
+    monthly["million_dollar_transactions"].fillna(0)
+)
+
+# Million-dollar transaction share
+monthly["million_dollar_share"] = (
+    monthly["million_dollar_transactions"]
+    .div(monthly["transaction_count"].replace(0, np.nan))
+    .mul(100)
+)
+
+# Year-over-year price change
+monthly["price_yoy_pct"] = (
+    monthly["median_price"]
+    .pct_change(periods=12, fill_method=None)
+    .mul(100)
+)
+
+# Rolling indicators
+monthly["volume_3m_avg"] = (
+    monthly["transaction_count"]
+    .rolling(window=3, min_periods=1)
+    .mean()
+)
+
+monthly["price_12m_median"] = (
+    monthly["median_price"]
+    .rolling(window=12, min_periods=6)
+    .median()
+)
+
+monthly["price_psm_12m_median"] = (
+    monthly["median_price_psm"]
+    .rolling(window=12, min_periods=6)
+    .median()
+)
+
+monthly = monthly.reset_index()
+
+print(monthly.tail(12).round(2))
+
+#Monthly HDB Resale Transaction Volume 
 import pandas as pd
-import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-sns.set_style("whitegrid")
+# Ensure the columns are valid and sorted chronologically
+monthly["month"] = pd.to_datetime(monthly["month"])
 
-MONTH_ABBR = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4,
-              'May': 5, 'Jun': 6, 'Jul': 7, 'Aug': 8,
-              'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
+plot_data = (
+    monthly[["month", "transaction_count"]]
+    .dropna()
+    .sort_values("month")
+)
 
-def parse_period(label: str) -> pd.Timestamp:
-    m = re.match(r'^(\d{4})([A-Za-z]{3})$', str(label))
-    if not m:
-        raise ValueError(f"Unexpected period label: {label}")
-    year = int(m.group(1))
-    mon = MONTH_ABBR[m.group(2).title()]
-    return pd.Timestamp(year=year, month=mon, day=1)
+# Find the highest and lowest monthly transaction volumes
+highest = plot_data.loc[plot_data["transaction_count"].idxmax()]
+lowest = plot_data.loc[plot_data["transaction_count"].idxmin()]
 
-def load_long(xlsx_path: str | Path) -> pd.DataFrame:
-    dfw = pd.read_excel(xlsx_path, header=0)
-    period_cols = [c for c in dfw.columns if re.match(r'^\d{4}[A-Za-z]{3}$', str(c))]
-    if not period_cols:
-        raise ValueError("No 'YYYYMon' columns found.")
-    series_col = dfw.columns[0]
-    dfw = dfw[[series_col] + period_cols].copy()
-    dfl = dfw.melt(id_vars=series_col, var_name='period', value_name='value')
-    dfl['date'] = dfl['period'].apply(parse_period)
-    dfl = dfl.rename(columns={series_col: 'series'}).drop(columns=['period'])
-    dfl['value'] = pd.to_numeric(dfl['value'], errors='coerce')
-    return dfl
+plt.figure(figsize=(14, 6))
 
-def find_series(dfl: pd.DataFrame, tokens: list[str]) -> pd.Series:
-    s = dfl['series'].str.lower().fillna('')
-    mask = np.ones(len(s), dtype=bool)
-    for t in tokens:
-        mask &= s.str.contains(t.lower(), regex=False)
-    candidates = dfl.loc[mask, 'series'].unique()
-    if len(candidates) == 0:
-        raise KeyError(f"No series matched tokens: {tokens}")
-    name = sorted(candidates, key=len, reverse=True)[0]
-    ts = (dfl[dfl['series'] == name]
-          .set_index('date')['value']
-          .sort_index()
-          .asfreq('MS'))
-    return ts.rename(name)
+sns.lineplot(
+    data=plot_data,
+    x="month",
+    y="transaction_count",
+    label="Monthly transactions",
+    color="navy",
+    alpha=0.7,
+)
 
-def build_design(price: pd.Series,
-                 quota: pd.Series | None,
-                 add_month_fe=True,
-                 lag1=True) -> pd.DataFrame:
-    parts = {'price': price}
-    if quota is not None:
-        parts['quota'] = quota
-    df = pd.concat(parts, axis=1)
-    df = df.replace([np.inf, -np.inf], np.nan).dropna()
-    df = df[df['price'] > 0]
-    if 'quota' in df.columns:
-        df = df[df['quota'] > 0]
-    df['ln_price'] = np.log(df['price'])
-    if 'quota' in df.columns:
-        df['ln_quota'] = np.log(df['quota'])
-    if lag1:
-        df['ln_price_lag1'] = df['ln_price'].shift(1)
-    if add_month_fe:
-        df['month'] = df.index.month.astype(int)
-        month_fe = pd.get_dummies(df['month'], prefix='m', drop_first=True)
-        df = pd.concat([df, month_fe], axis=1)
-    df = df.dropna()
-    return df
+# Highlight the highest point
+plt.scatter(
+    highest["month"],
+    highest["transaction_count"],
+    color="red",
+    label="Highest",
+)
 
-def fit_log_ols(df: pd.DataFrame, include_month_fe=True):
-    X_cols = ['ln_price_lag1']
-    if 'ln_quota' in df.columns:
-        X_cols = ['ln_quota'] + X_cols
-    if include_month_fe:
-        X_cols += [c for c in df.columns if c.startswith('m_')]
-    X = df[X_cols].apply(pd.to_numeric, errors='coerce').astype(float)
-    y = pd.to_numeric(df['ln_price'], errors='coerce').astype(float)
-    X = sm.add_constant(X, has_constant='add')
-    model = sm.OLS(y, X, missing='drop')
-    res = model.fit(cov_type='HC1')
-    return res, X_cols
+plt.annotate(
+    text=(
+        f'Highest: {highest["transaction_count"]:,.0f}\n'
+        f'{highest["month"]:%b %Y}'
+    ),
+    xy=(highest["month"], highest["transaction_count"]),
+    xytext=(0, 30),
+    textcoords="offset points",
+    ha="center",
+    color="red",
+    fontweight="bold",
+    arrowprops={
+        "arrowstyle": "->",
+        "color": "red",
+    },
+)
 
-def plot_predictability(df: pd.DataFrame,
-                        res,
-                        title_prefix: str,
-                        outfile_prefix: str):
-    # Align fitted on df index
-    y_log = df['ln_price'].copy()
-    yhat_log = pd.Series(res.fittedvalues, index=y_log.index)
-    # Transform back to price scale (visual; ignores log-bias)
-    y = np.exp(y_log)
-    yhat = np.exp(yhat_log)
+# Highlight the lowest point
+plt.scatter(
+    lowest["month"],
+    lowest["transaction_count"],
+    color="green",
+    label="Lowest",
+)
 
-    # Metrics
-    r2 = res.rsquared
-    mape = np.mean(np.abs((y - yhat) / y)) * 100.0
+plt.annotate(
+    text=(
+        f'Lowest: {lowest["transaction_count"]:,.0f}\n'
+        f'{lowest["month"]:%b %Y}'
+    ),
+    xy=(lowest["month"], lowest["transaction_count"]),
+    xytext=(0, -45),
+    textcoords="offset points",
+    ha="center",
+    color="green",
+    fontweight="bold",
+    arrowprops={
+        "arrowstyle": "->",
+        "color": "green",
+    },
+)
 
-    # 1) Time-series overlay
-    plt.figure(figsize=(11, 5))
-    plt.plot(y.index, y.values, label="Actual price", color="#1f77b4")
-    plt.plot(yhat.index, yhat.values, label="Fitted price", color="#ff7f0e", alpha=0.9)
-    plt.title(f"{title_prefix} — Actual vs Fitted (price scale)\nR^2={r2:.3f} (log scale), MAPE={mape:.1f}%")
-    plt.ylabel("Price")
-    plt.xlabel("Year")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{outfile_prefix}_timeseries.png", dpi=150)
-    plt.show()
+plt.title("Monthly HDB Resale Transaction Volume")
+plt.xlabel("Year")
+plt.ylabel("Number of transactions")
+plt.legend()
+plt.tight_layout()
+plt.show()
 
-    # 2) Scatter actual vs fitted with 45-degree line
-    plt.figure(figsize=(6, 6))
-    sns.scatterplot(x=y.values, y=yhat.values, s=24, alpha=0.7)
-    lims = [0, max(np.nanmax(y.values), np.nanmax(yhat.values)) * 1.05]
-    plt.plot(lims, lims, 'k--', linewidth=1, label="45° line")
-    plt.xlim(lims); plt.ylim(lims)
-    plt.xlabel("Actual price")
-    plt.ylabel("Fitted price")
-    plt.title(f"{title_prefix} — Actual vs Fitted Scatter\nR^2={r2:.3f} (log scale)")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(f"{outfile_prefix}_scatter.png", dpi=150)
-    plt.show()
+town_summary = (
+    df.groupby("town")
+      .agg(
+          transactions=("resale_price", "size"),
+          median_price=("resale_price", "median"),
+          median_price_psm=("price_psm", "median"),
+          median_floor_area=("floor_area_sqm", "median"),
+          million_dollar_sales=("million_dollar", "sum"),
+      )
+      .reset_index()
+)
 
-def main(xlsx_path: str | Path):
-    dfl = load_long(xlsx_path)
+town_summary["million_dollar_share"] = (
+    town_summary["million_dollar_sales"]
+    .div(town_summary["transactions"])
+    .mul(100)
+)
 
-    # Category A (price: 1st bidding). Quota may be unavailable; we’ll fit AR(1)+month FE if so.
-    catA_price_tokens = ["Cars Up To 1600cc And 97kW", "Quota Premium", "1st Bidding"]
-    catA_price = find_series(dfl, catA_price_tokens)
-    catA_quota = None
-    try:
-        # Try common quota labels if present in your file
-        catA_quota = find_series(dfl, ["Cars Up To 1600cc And 97kW", "Quota", "1st Bidding"])
-    except KeyError:
-        try:
-            catA_quota = find_series(dfl, ["Cars Up To 1600cc And 97kW", "Quota", "2nd Bidding"])
-        except KeyError:
-            catA_quota = None  # proceed without quota
+#Town Summary
+town_summary = (
+    town_summary[
+        town_summary["transactions"] >= 100
+    ]
+    .sort_values("median_price_psm", ascending=False)
+)
 
-    A_df = build_design(catA_price, catA_quota, add_month_fe=True, lag1=True)
-    A_res, _ = fit_log_ols(A_df, include_month_fe=True)
-    plot_predictability(A_df, A_res,
-                        title_prefix="Category A (≤1600cc/97kW)",
-                        outfile_prefix="catA_predictability")
+print(town_summary.head(10).round(2))
 
-    # Category B (price: 1st bidding; quota: try 2nd bidding first, else 1st)
-    catB_price_tokens = ["Cars Above 1600cc Or 97kW", "Quota Premium", "1st Bidding"]
-    catB_price = find_series(dfl, catB_price_tokens)
-    catB_quota = None
-    for tok in [
-        ["Cars Above 1600cc Or 97kW", "Quota", "2nd Bidding"],
-        ["Cars Above 1600cc Or 97kW", "Quota", "1st Bidding"],
-    ]:
-        try:
-            catB_quota = find_series(dfl, tok)
-            break
-        except KeyError:
-            continue
-    if catB_quota is None:
-        raise KeyError("Category B quota series not found.")
 
-    B_df = build_design(catB_price, catB_quota, add_month_fe=True, lag1=True)
-    B_res, _ = fit_log_ols(B_df, include_month_fe=True)
-    plot_predictability(B_df, B_res,
-                        title_prefix="Category B (>1600cc/97kW)",
-                        outfile_prefix="catB_predictability")
 
-if __name__ == "__main__":
-    xlsx_path = "MotorVehicleQuotaQuotaPremiumAndPrevailingQuotaPremiumMonthly.xlsx"
-    main(xlsx_path)
+
+import pandas as pd
+
+town_summary = (
+    df.groupby("town", as_index=False)
+      .agg(
+          transactions=("resale_price", "size"),
+          median_price=("resale_price", "median"),
+          median_price_psm=("price_psm", "median"),
+          median_floor_area=("floor_area_sqm", "median"),
+          million_dollar_sales=("million_dollar", "sum"),
+      )
+
+)
+
+
+# Calculate the percentage of million-dollar sales
+town_summary["million_dollar_share"] = (
+    town_summary["million_dollar_sales"]
+    .div(town_summary["transactions"])
+    .mul(100)
+)
+
+# Sort towns by median price per square metre
+town_summary = (
+    town_summary
+    .sort_values(
+        by="town",
+        ascending=True,
+    )
+)
+
+# Start the displayed ranking at 1
+town_summary.index = town_summary.index + 1
+town_summary.index.name = "rank"
+
+# Confirm the number of towns
+print(f"Number of towns: {town_summary['town'].nunique()}")
+
+# Display all towns and columns as a table
+with pd.option_context(
+    "display.max_rows", 26,
+    "display.max_columns", None,
+    "display.width", None,
+):
+    display(town_summary)
+
+#Room trends 
+import pandas as pd
+
+flat_type_summary = (
+    df.groupby("flat_type", as_index=False)
+      .agg(
+          transactions=("resale_price", "size"),
+          median_price=("resale_price", "median"),
+          median_price_psm=("price_psm", "median"),
+          median_area=("floor_area_sqm", "median"),
+      )
+      .sort_values("median_price")
+      .reset_index(drop=True)
+)
+
+
+
+display(flat_type_summary.round(2))
+
+
+# Median Resale Price by Flat Type and Median Price per Square Metre by Flat Type 
+fig, axes = plt.subplots(
+    nrows=1,
+    ncols=2,
+    figsize=(15, 6),
+)
+
+sns.barplot(
+    data=flat_type_summary,
+    x="median_price",
+    y="flat_type",
+    hue="flat_type",
+    legend=False,
+    ax=axes[0],
+    palette="Blues_d",
+)
+
+axes[0].set_title("Median Resale Price by Flat Type")
+axes[0].set_xlabel("Median price")
+axes[0].set_ylabel("Flat type")
+
+sns.barplot(
+    data=flat_type_summary,
+    x="median_price_psm",
+    y="flat_type",
+    hue="flat_type",
+    legend=False,
+    ax=axes[1],
+    palette="Oranges_d",
+)
+
+axes[1].set_title("Median Price per Square Metre by Flat Type")
+axes[1].set_xlabel("Median price per sqm")
+axes[1].set_ylabel("")
+
+plt.tight_layout()
+plt.show()
+
+# Remaining Lease
+import pandas as pd
+import numpy as np
+
+df["remaining_lease_age_group"] = pd.cut(
+    df["estimated_remaining_lease"],
+    bins=[-np.inf, 10, 20, 30, 40, 50, 60, 70, 80, 90, np.inf],
+    labels=[
+        "0–10 years",
+        "11–20 years",
+        "21–30 years",
+        "31–40 years",
+        "41–50 years",
+        "51–60 years",
+        "61–70 years",
+        "71–80 years",
+        "81–90 years",
+        "Over 90 years",
+    ],
+)
+
+remaining_lease_summary = (
+    df.dropna(subset=["remaining_lease_age_group"])
+      .groupby("remaining_lease_age_group", observed=True)
+      .agg(
+          transactions=("resale_price", "size"),
+          median_price=("resale_price", "median"),
+          median_price_psm=("price_psm", "median"),
+      )
+      .reset_index()
+)
+
+# Add a total row
+total_row = pd.DataFrame({
+    "remaining_lease_age_group": ["TOTAL"],
+    "transactions": [remaining_lease_summary["transactions"].sum()],
+})
+
+remaining_lease_summary = pd.concat(
+    [remaining_lease_summary, total_row],
+    ignore_index=True,
+)
+
+display(remaining_lease_summary.round(2))
+
+print(remaining_lease_summary.round(2))
+
+# Town with Transaction with Minimum Remaining Lease, Median Remaining Lease, Average Remaining Lease and Maximum Remaining Lease 
+
+# Normalize column names, for example:
+# "Remaining Lease" -> "remaining_lease"
+df.columns = (
+    df.columns
+      .str.strip()
+      .str.lower()
+      .str.replace(r"\s+", "_", regex=True)
+)
+
+
+town_remaining_lease = (
+    df.groupby("town", as_index=False)
+      .agg(
+          transactions=("remaining_lease_years", "size"),
+          minimum_remaining_lease_years=(
+              "remaining_lease_years",
+              "min",
+          ),
+          median_remaining_lease_years=(
+              "remaining_lease_years",
+              "median",
+          ),
+          average_remaining_lease_years=(
+              "remaining_lease_years",
+              "mean",
+          ),
+          maximum_remaining_lease_years=(
+              "remaining_lease_years",
+              "max",
+          ),
+      )
+      .sort_values(
+          "town",
+          ascending=True,
+      )
+      .reset_index(drop=True)
+)  # Closes town_remaining_lease = (
+
+# Round remaining-lease values
+lease_columns = [
+    "minimum_remaining_lease_years",
+    "median_remaining_lease_years",
+    "average_remaining_lease_years",
+    "maximum_remaining_lease_years",
+]
+
+town_remaining_lease[lease_columns] = (
+    town_remaining_lease[lease_columns].round(1)
+)
+
+# Display every town
+with pd.option_context(
+    "display.max_rows", None,
+    "display.max_columns", None,
+    "display.width", None,
+):
+    display(town_remaining_lease)
+
+#Storey Trends
+storey_summary = (
+    df.dropna(subset=["storey_lower"])
+      .groupby("storey_range")
+      .agg(
+          lower_storey=("storey_lower", "first"),
+          transactions=("resale_price", "size"),
+          median_price=("resale_price", "median"),
+          median_price_psm=("price_psm", "median"),
+      )
+      .reset_index()
+      .sort_values("lower_storey")
+)
+
+print(storey_summary.round(2))
+
+# Monthly Median HDB Resale Price per Square Metre by Year 
+plt.figure(figsize=(14, 7))
+
+sns.lineplot(
+    data=seasonality,
+    x="month_number",
+    y="median_price_psm",
+    hue="year",
+    marker="o",
+    palette="tab10"
+)
+
+plt.xticks(
+    range(1, 13),
+    [calendar.month_abbr[i] for i in range(1, 13)]
+)
+
+plt.title("Monthly Median HDB Resale Price per Square Metre by Year")
+plt.xlabel("Month")
+plt.ylabel("Median Price per Square Metre")
+plt.grid(alpha=0.3)
+plt.legend(
+    title="Year",
+    bbox_to_anchor=(1.02, 1),
+    loc="upper left"
+)
+plt.tight_layout()
+plt.show()
+
+# Average HDB Resale Transaction Volume by Calendar Month 
+import calendar
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Calculate overall monthly seasonality
+overall_seasonality = (
+    seasonality
+    .groupby("month_number", as_index=False)
+    .agg(
+        average_transaction_count=(
+            "transaction_count",
+            "mean"
+        )
+    )
+    .sort_values("month_number")
+)
+
+# Add abbreviated month names
+overall_seasonality["month_name"] = (
+    overall_seasonality["month_number"]
+    .map(lambda month: calendar.month_abbr[int(month)])
+)
+
+# Find the highest and lowest values
+highest = overall_seasonality.loc[
+    overall_seasonality[
+        "average_transaction_count"
+    ].idxmax()
+]
+
+lowest = overall_seasonality.loc[
+    overall_seasonality[
+        "average_transaction_count"
+    ].idxmin()
+]
+
+# Plot
+plt.figure(figsize=(13, 6))
+
+sns.lineplot(
+    data=overall_seasonality,
+    x="month_number",
+    y="average_transaction_count",
+    marker="o",
+    color="steelblue"
+)
+
+# Highlight the highest point
+plt.scatter(
+    highest["month_number"],
+    highest["average_transaction_count"],
+    color="red",
+    s=110,
+    zorder=5,
+    label="Highest"
+)
+
+# Highlight the lowest point
+plt.scatter(
+    lowest["month_number"],
+    lowest["average_transaction_count"],
+    color="green",
+    s=110,
+    zorder=5,
+    label="Lowest"
+)
+
+# Annotate the highest point
+plt.annotate(
+    text=(
+        f'Highest: '
+        f'{highest["average_transaction_count"]:,.0f}\n'
+        f'{highest["month_name"]}'
+    ),
+    xy=(
+        highest["month_number"],
+        highest["average_transaction_count"]
+    ),
+    xytext=(0, 45),
+    textcoords="offset points",
+    ha="center",
+    color="red",
+    fontweight="bold",
+    arrowprops={
+        "arrowstyle": "->",
+        "color": "red"
+    }
+)
+
+# Annotate the lowest point
+plt.annotate(
+    text=(
+        f'Lowest: '
+        f'{lowest["average_transaction_count"]:,.0f}\n'
+        f'{lowest["month_name"]}'
+    ),
+    xy=(
+        lowest["month_number"],
+        lowest["average_transaction_count"]
+    ),
+    xytext=(0, -55),
+    textcoords="offset points",
+    ha="center",
+    color="green",
+    fontweight="bold",
+    arrowprops={
+        "arrowstyle": "->",
+        "color": "green"
+    }
+)
+
+# Formatting
+plt.title(
+    "Average HDB Resale Transaction Volume by Calendar Month"
+)
+plt.xlabel("Month")
+plt.ylabel("Average Number of Transactions")
+
+plt.xticks(
+    ticks=range(1, 13),
+    labels=[
+        calendar.month_abbr[i]
+        for i in range(1, 13)
+    ]
+)
+
+plt.grid(alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# Display values
+display(overall_seasonality.round(2))
+
+# Price PSM Year Over Year Percent 
+
+town_year = (
+    df.groupby(["town", "year"])
+      .agg(
+          transactions=("resale_price", "size"),
+          median_price_psm=("price_psm", "median"),
+      )
+      .reset_index()
+      .sort_values(["town", "year"])
+)
+
+town_year["price_psm_yoy_pct"] = (
+    town_year.groupby("town")["median_price_psm"]
+    .pct_change(fill_method=None)
+    .mul(100)
+)
+
+latest_year = town_year["year"].max()
+
+fastest_growing_towns = (
+    town_year[
+        (town_year["year"] == latest_year) &
+        (town_year["transactions"] >= 50)
+    ]
+    .sort_values("price_psm_yoy_pct", ascending=False)
+)
+
+print(
+    fastest_growing_towns[
+        [
+            "town",
+            "transactions",
+            "median_price_psm",
+            "price_psm_yoy_pct",
+        ]
+    ].head(27).round(2)
+)
+
+
